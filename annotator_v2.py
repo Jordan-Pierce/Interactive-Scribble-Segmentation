@@ -134,6 +134,9 @@ class Annotator(PyQt5.QtWidgets.QWidget):
         # self.showMaximized()
         print(self.introText(False))
 
+        # Add this to the __init__ method
+        self.drawing_mode = 1  # 1 for positive, -1 for negative
+
     @classmethod
     def fromFilename(cls, filename):
         '''
@@ -149,20 +152,70 @@ class Annotator(PyQt5.QtWidgets.QWidget):
         return annotator
 
     @classmethod
-    def fromRgba(cls, rgba):
+    def fromRGB(cls, im, net_name, instant_seg=False, negative_skeleton=False,
+                resize_size=128, url=None):
         '''
-        Initializes an Annotator with an image given as an rgba array.
+        Initializes an Annotator with an image 
         Parameters
         ----------
-        rgba : (..., 4) array with dtype uint8.
+        grat : 2D array with dtype uint8.
         '''
-        rgba = rgba.copy()  # check whether needed
-        qimage = PyQt5.QtGui.QImage(rgba.data, rgba.shape[1], rgba.shape[0],
-                                    PyQt5.QtGui.QImage.Format_RGBA8888)
+        if im.ndim == 2:
+            gray = im.copy()  # check whether needed
+
+            bytesPerLine = gray.nbytes//gray.shape[0]
+            qimage = PyQt5.QtGui.QImage(gray.data, gray.shape[1], gray.shape[0],
+                                        bytesPerLine,
+                                        PyQt5.QtGui.QImage.Format_Grayscale8)
+            imagePix = PyQt5.QtGui.QPixmap(qimage)
+        else:
+            b, g, r = im[:, :, 0], im[:, :, 1], im[:, :, 2]
+            if (b == g).all() and (b == r).all():
+                im1 = b.copy()
+                bytesPerLine = im1.nbytes//im1.shape[0]
+                qimage = PyQt5.QtGui.QImage(im1.data, im1.shape[1], im1.shape[0],
+                                            bytesPerLine,
+                                            PyQt5.QtGui.QImage.Format_Grayscale8)
+            else:
+                im1 = im.copy()  # check whether needed
+                # im = np.require(im, np.uint8, 'C')
+                totalBytes = im1.nbytes
+                # divide by the number of rows
+                bytesPerLine = int(totalBytes/im1.shape[0])
+
+                qimage = PyQt5.QtGui.QImage(im1.data, im1.shape[1], im1.shape[0], bytesPerLine,
+                                            PyQt5.QtGui.QImage.Format_RGB888)
+
         imagePix = PyQt5.QtGui.QPixmap(qimage)
-        annotator = Annotator(imagePix.size())
+        annotator = Annotator(imagePix.size(), resize_size)
         annotator.imagePix = imagePix
-        annotator.annotationsFilename = 'from_rgba_annotations.png'
+        annotator.annotationsFilename = 'test_annotations.png'
+
+        device = "cuda"
+        path = "runs"
+        name = os.path.join(path, net_name+".pt")
+
+        # arg_name = ''.join(filter(lambda x: not x.isdigit(),net_name))
+        arg_name = net_name.split('_')[0]
+        args = get_args(name=arg_name)
+        annotator.recon_mode = args.training.recon_mode
+        # args = get_args(name=arg_name[:-1])
+
+        net = AbstractUNet(args).to(device)
+
+        ckpt = torch.load(name, map_location=lambda storage, loc: storage)
+        # args = ckpt['args']
+        # args = update_args(args)
+        net.load_state_dict(ckpt["net"])
+
+        annotator.orig_im = im
+        annotator.im_size = im.shape[:2]  # Add this line!
+        annotator.net = net
+        annotator.net.eval()
+        annotator.device = device
+        annotator.instant_seg = instant_seg
+        annotator.negative_skeleton = negative_skeleton
+        annotator.url = url
         return annotator
 
     @classmethod
@@ -187,7 +240,7 @@ class Annotator(PyQt5.QtWidgets.QWidget):
 
     @classmethod
     def fromFolder(cls, folder_name, net_name, instant_seg=False, negative_skeleton=False,
-                   resize_size=128, url=None):
+                resize_size=128, url=None):
         file_list = glob.glob(os.path.join(folder_name, "*.png")) + \
             glob.glob(os.path.join(folder_name, "*.jpg"))
         # random.shuffle(file_list)
@@ -241,6 +294,7 @@ class Annotator(PyQt5.QtWidgets.QWidget):
         annotator.annotationsFilename = os.path.join(
             "annotations", os.path.basename(im_name).replace('jpg', 'png'))
         annotator.orig_im = im
+        annotator.im_size = im.shape[:2]  # Add this line!
         annotator.file_list = file_list
         annotator.net = net
         annotator.net.eval()
@@ -504,6 +558,7 @@ class Annotator(PyQt5.QtWidgets.QWidget):
 
     def mousePressEvent(self, event):
         if event.button() == PyQt5.QtCore.Qt.LeftButton:
+            self.drawing_mode = 1  # Positive drawing
             if self.zPressed:  # initiate zooming and not drawing
                 # clear (fill with transparent)
                 self.cursorPix.fill(self.color_picker(label=0, opacity=0))
@@ -513,12 +568,34 @@ class Annotator(PyQt5.QtWidgets.QWidget):
             else:  # initiate drawing
                 painter_scribble = self.makePainter(self.annotationPix,
                                                     self.color_picker(self.label,
-                                                                      (self.label > 0)*self.annotationOpacity))  # the painter used for drawing
+                                                                    (self.label > 0)*self.annotationOpacity))  # the painter used for drawing
                 painter_scribble.drawPoint(event.pos())
 
                 painter_resize = self.makePainter_resize(self.resizePix,
-                                                         self.color_picker(self.label,
-                                                                           (self.label > 0)*self.annotationOpacity))  # the painter used for drawing
+                                                        self.color_picker(self.label,
+                                                                        (self.label > 0)*self.annotationOpacity))  # the painter used for drawing
+                point = PyQt5.QtCore.QPoint(
+                    int((event.x()-self.padding.x())/self.size.width() * self.resize_size),
+                    int((event.y()-self.padding.y())/self.size.height() * self.resize_size)
+                )
+                painter_resize.drawPoint(point)
+
+                self.last_resize_point = point
+                self.lastDrawPoint = event.pos()
+                self.activelyDrawing = True
+            self.update()
+        elif event.button() == PyQt5.QtCore.Qt.RightButton:
+            self.drawing_mode = -1  # Negative drawing
+            # Same drawing logic but with negative mode
+            if not self.zPressed:
+                painter_scribble = self.makePainter(self.annotationPix,
+                                                    self.color_picker(self.label,
+                                                                    (self.label > 0)*self.annotationOpacity))  # the painter used for drawing
+                painter_scribble.drawPoint(event.pos())
+
+                painter_resize = self.makePainter_resize(self.resizePix,
+                                                        self.color_picker(self.label,
+                                                                        (self.label > 0)*self.annotationOpacity))  # the painter used for drawing
                 point = PyQt5.QtCore.QPoint(
                     int((event.x()-self.padding.x())/self.size.width() * self.resize_size),
                     int((event.y()-self.padding.y())/self.size.height() * self.resize_size)
@@ -541,24 +618,25 @@ class Annotator(PyQt5.QtWidgets.QWidget):
             w = abs(self.lastCursorPoint.x() - event.x())
             h = abs(self.lastCursorPoint.y() - event.y())
             painter_scribble.fillRect(x, y, w, h,
-                                      self.color_picker(0, self.zoomOpacity))
+                                    self.color_picker(0, self.zoomOpacity))
         else:
             if self.activelyDrawing:
                 painter_scribble = self.makePainter(self.annotationPix,
                                                     self.color_picker(self.label,
-                                                                      (self.label > 0)*self.annotationOpacity))  # the painter used for drawing
+                                                                    (self.label > 0)*self.annotationOpacity))  # the painter used for drawing
                 painter_scribble.drawLine(self.lastDrawPoint, event.pos())
                 self.lastDrawPoint = event.pos()
+                
                 painter_resize = self.makePainter_resize(self.resizePix,
-                                                         self.color_picker(self.label,
-                                                                           (self.label > 0)*self.annotationOpacity))  # the painter used for drawing
+                                                        self.color_picker(self.label,
+                                                                        (self.label > 0)*self.annotationOpacity))  # the painter used for drawing
                 point = PyQt5.QtCore.QPoint(
                     int((event.x()-self.padding.x())/self.size.width() * self.resize_size),
                     int((event.y()-self.padding.y())/self.size.height() * self.resize_size)
                 )
                 painter_resize.drawLine(self.last_resize_point, point)
                 self.last_resize_point = point
-
+                
                 if self.instant_seg and self.done_predicting:
                     self.predict()
             if self.zPressed:
@@ -904,6 +982,16 @@ class Annotator(PyQt5.QtWidgets.QWidget):
     def closeEvent(self, event):
         PyQt5.QtWidgets.QApplication.quit()
         self.close()
+
+    # Modify the color_picker or create a new method
+    def get_drawing_color(self, label, opacity, is_negative=False):
+        if is_negative:
+            # Use dashed line or different opacity for negative strokes
+            color = PyQt5.QtGui.QColor(self.colors[label][0], self.colors[label][1], 
+                    self.colors[label][2], int(opacity*128))  # Half opacity
+            return color
+        else:
+            return self.color_picker(label, opacity)
 
 
 def annotate(image_path, net_name, instant_seg=False, negative_skeleton=False,

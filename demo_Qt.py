@@ -12,7 +12,9 @@ import argparse
 
 parser = argparse.ArgumentParser()
 
-parser.add_argument("-p","--path", type=str, help="Path to images", default="images")
+parser.add_argument("-p", "--path", type=str, 
+                    default="C:\\Users\\jordan\\Documents\\GitHub\\CoralNet-Toolbox\\data\\4356\\images",
+                    help="Path to images",)
 
 args = parser.parse_args()
 
@@ -29,11 +31,10 @@ net_name = "amix_150000"
 if not os.path.isdir("annotations"):
     os.mkdir("annotations")
 
-resize_size = 256 if net_name.split('_')[0].find('256') != -1 else 128
+resize_size = 1024 if net_name.split('_')[0].find('256') != -1 else 1024
 
 
 ann.annotate(image_path, net_name,
-            instant_seg=instant_bool,
-            negative_skeleton=negative_skeleton,
-            resize_size=resize_size,
-            )
+             instant_seg=instant_bool,
+             negative_skeleton=negative_skeleton,
+             resize_size=resize_size)
